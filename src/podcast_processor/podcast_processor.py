@@ -260,7 +260,7 @@ class PodcastProcessor:
                         "api_base": self.config.openai_base_url,
                         "test_mode": isinstance(self.config.whisper, TestWhisperConfig),
                         "episode": post.guid,
-                        "feed": post.feed_id,
+                        "feed": post.feed.storage_namespace,
                     }
                 ),
             )

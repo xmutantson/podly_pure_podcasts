@@ -129,10 +129,13 @@ def test_download_recovers_stale_database_path(
 ) -> None:
     _, post, _, module = runtime
     from app import posts
-    from shared.podcast_downloader import get_and_make_download_path
+    from shared.podcast_downloader import download_episode
 
-    source = get_and_make_download_path(post)
-    source.write_bytes(b"completed source")
+    download = MagicMock(
+        return_value=SimpleNamespace(status_code=200, content=b"completed source")
+    )
+    monkeypatch.setattr("shared.podcast_downloader.requests.get", download)
+    source = Path(cast(str, download_episode(post)))
     post.unprocessed_audio_path = "missing.mp3"
     post.processed_audio_path = "missing-result.mp3"
     process = MagicMock(return_value="result.mp3")
@@ -140,6 +143,7 @@ def test_download_recovers_stale_database_path(
     assert posts.download_and_process_post(post.guid) == "result.mp3"
     assert post.unprocessed_audio_path == str(source)
     assert source.read_bytes() == b"completed source"
+    download.assert_called_once()
     process.assert_called_once()
 
 

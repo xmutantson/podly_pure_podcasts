@@ -18,18 +18,42 @@ coordination remains outside this patch; processing locks are process-local.
 
 ## Stable audio identity
 
-New download filenames use a SHA-256 identity derived from the feed database ID
-and episode GUID (episode ID/URL fallback for incomplete post objects). Titles
-are display metadata and can change without changing the source path. Identity
-is in the filename so processed-output and classification paths inherit the
-same separation, even when feed titles also collide.
+Each feed now has a persistent random UUID storage namespace, separate from its
+SQLite primary key. The follow-up independent review demonstrated that SQLite
+can reuse a deleted feed ID, so the previous numeric-ID/GUID filename policy
+was insufficient. Deleting and recreating a feed generates a fresh namespace,
+even if its RSS URL, episode GUID, enclosure URL, and title are all unchanged.
+Renaming a feed/episode or updating its RSS address retains the existing namespace.
 
-Persisted database audio paths continue to support existing installations. We do
-not scan, migrate, delete, or assume ownership of old title-only files. An
-unreferenced legacy title file is not an automatic cache hit. Already persisted
-historical collisions cannot be authenticated retroactively and need manual
-inspection before clearing only the affected database paths and reprocessing.
-Cleanup now uses the persisted source path rather than guessing from a title.
+Version 2 download paths (`in/v2/episode-v2-<hash>/episode-v2-<hash>.mp3`) hash the
+storage version, namespace, and episode GUID. The identity remains in the filename
+so processed-output and classification paths inherit the separation. Database
+Post objects without a persisted namespace are rejected; non-database URL-only
+callers use a versioned enclosure-URL identity, never reusable numeric IDs.
+
+A same-directory JSON receipt records versioned ownership and the audio SHA-256.
+Disk-discovered downloads are reusable only when this receipt and file contents
+match. Missing, malformed, stale-owner/version, empty, or modified files trigger
+a fresh download. The audio publishes atomically before its receipt; interruption
+between the two cannot bless mismatched bytes. Successful repeat downloads reuse
+the verified cache. Verification reads the whole file and adds disk I/O.
+
+Migration `f72b62c9d310` follows `ded4b70feadb`, backfills one random namespace per
+existing feed, and enforces uniqueness/non-nullability. The normal Flask-Migrate
+startup upgrade applies it; repeating startup does not rotate namespaces. Run the
+migration before using the changed model against an existing database. The new
+column has an ORM default for new feeds; raw SQL feed creators must supply their
+own unique UUID namespace. No deployment database was touched in this repair.
+
+Existing database audio paths, transcript records, and whitelist flags are
+preserved. Explicit persisted paths remain usable for migration compatibility;
+they are not retroactively proven by a new receipt. We do not scan, migrate,
+delete, or adopt old title-only/numeric-ID files. An orphaned legacy file never
+becomes a new download merely because a computed name matches. Historical wrong
+bytes already associated with a database row still require manual inspection.
+Cleanup uses the persisted source path rather than guessing from a title.
+Downgrading removes the namespace column but retains media and Post paths;
+re-upgrading assigns new namespaces and does not adopt orphaned version 2 files.
 
 ## HTTP recovery and whitelist behavior
 

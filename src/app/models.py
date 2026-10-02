@@ -1,5 +1,6 @@
 import json
 import os
+import uuid
 from typing import List, Optional
 
 from markupsafe import Markup
@@ -11,6 +12,10 @@ from podcast_processor.transcribe import Segment
 # mypy typing issue https://github.com/python/mypy/issues/17918
 class Feed(db.Model):  # type: ignore[name-defined, misc]
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # Numeric SQLite IDs can be reused after deletion; storage namespaces cannot.
+    storage_namespace = db.Column(
+        db.String(32), nullable=False, unique=True, default=lambda: uuid.uuid4().hex
+    )
     alt_id = db.Column(
         db.Text, nullable=True
     )  # used for backwards compatibility with feeds defined in config.yml
