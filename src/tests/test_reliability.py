@@ -8,7 +8,7 @@ import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Iterator, Optional
+from typing import Any, Iterator, Optional, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -131,7 +131,7 @@ def test_download_recovers_stale_database_path(
     from app import posts
     from shared.podcast_downloader import get_and_make_download_path
 
-    source = get_and_make_download_path(post.title)
+    source = get_and_make_download_path(post)
     source.write_bytes(b"completed source")
     post.unprocessed_audio_path = "missing.mp3"
     post.processed_audio_path = "missing-result.mp3"
@@ -250,7 +250,18 @@ def test_classification_validates_cache(
         classification_path=folder.parent,
     )
     assert cache.read_text() == valid
-    assert call.call_count == (0 if cached == valid else 1)
+    # Legacy responses lack provenance, even if syntactically valid.
+    assert call.call_count == 1
+    processor.classify(
+        transcript_segments=[segment],
+        model="offline",
+        system_prompt="",
+        user_prompt_template=Template("synthetic"),
+        num_segments_per_prompt=30,
+        post=post,
+        classification_path=folder.parent,
+    )
+    assert call.call_count == 1
     assert not (folder / ".in_progress").exists()
 
 
@@ -373,3 +384,154 @@ def test_timeout_returns_successful_result() -> None:
         return "completed"
 
     assert work() == "completed"
+
+
+@pytest.mark.parametrize(
+    "changed", ["transcript", "model", "system", "prompt", "chunk_size"]
+)
+def test_classification_cache_is_bound_to_current_inputs(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch, changed: str
+) -> None:
+    _, post, processor, module = runtime
+    segments = [
+        module.Segment(start=0, end=1, text="first"),
+        module.Segment(start=1, end=2, text="second"),
+    ]
+    call = MagicMock(return_value='{"ad_segments": [], "confidence": 1}')
+    monkeypatch.setattr(processor, "call_model", call)
+    kwargs: dict[str, Any] = {
+        "transcript_segments": segments,
+        "model": "offline",
+        "system_prompt": "",
+        "user_prompt_template": Template("{{ transcript }}"),
+        "num_segments_per_prompt": 2,
+        "post": post,
+        "classification_path": Path("classification"),
+    }
+    processor.classify(**kwargs)
+    processor.classify(**kwargs)
+    assert call.call_count == 1
+    if changed == "transcript":
+        segments[0].text = "corrected transcript"
+    elif changed == "model":
+        kwargs["model"] = "different-model"
+    elif changed == "system":
+        kwargs["system_prompt"] = "different instructions"
+    elif changed == "prompt":
+        kwargs["user_prompt_template"] = Template("new prompt {{ transcript }}")
+    else:
+        kwargs["num_segments_per_prompt"] = 1
+    processor.classify(**kwargs)
+    assert call.call_count == (3 if changed == "chunk_size" else 2)
+    assert processor.get_ad_segments(segments, Path("classification")) == []
+
+
+def test_current_manifest_rejects_incomplete_and_altered_results(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, post, processor, module = runtime
+    segments = [
+        module.Segment(start=0, end=1, text="first"),
+        module.Segment(start=1, end=2, text="second"),
+    ]
+    call = MagicMock(
+        side_effect=[
+            '{"ad_segments": [], "confidence": 1}',
+            RuntimeError("interrupted"),
+        ]
+    )
+    monkeypatch.setattr(processor, "call_model", call)
+    kwargs: dict[str, Any] = {
+        "transcript_segments": segments,
+        "model": "offline",
+        "system_prompt": "",
+        "user_prompt_template": Template(""),
+        "num_segments_per_prompt": 1,
+        "post": post,
+        "classification_path": Path("classification"),
+    }
+    with pytest.raises(RuntimeError):
+        processor.classify(**kwargs)
+    with pytest.raises(module.ProcessorException):
+        processor.get_ad_segments(segments, Path("classification"))
+    call.side_effect = None
+    call.return_value = '{"ad_segments": [], "confidence": 1}'
+    processor.classify(**kwargs)
+    assert call.call_count == 3  # The completed current chunk was reused.
+    assert processor.get_ad_segments(segments, Path("classification")) == []
+    Path("classification/0.0_1.0/identification.txt").write_text(
+        '{"ad_segments": [0], "confidence": 1}'
+    )
+    with pytest.raises(module.ProcessorException):
+        processor.get_ad_segments(segments, Path("classification"))
+    processor.classify(**kwargs)
+    assert call.call_count == 4
+    segments[0].text = "changed"
+    with pytest.raises(module.ProcessorException):
+        processor.get_ad_segments(segments, Path("classification"))
+
+
+def test_download_identity_is_stable_and_ignores_legacy_title_cache(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, post, _, _ = runtime
+    from shared import podcast_downloader as downloader
+    from shared.processing_paths import paths_from_unprocessed_path
+
+    legacy = Path("in/Synthetic episode/Synthetic episode.mp3")
+    legacy.parent.mkdir(parents=True)
+    legacy.write_bytes(b"unowned old bytes")
+    request = MagicMock(
+        side_effect=[
+            SimpleNamespace(status_code=200, content=b"first"),
+            SimpleNamespace(status_code=200, content=b"second"),
+        ]
+    )
+    monkeypatch.setattr("shared.podcast_downloader.requests.get", request)
+    first = downloader.download_episode(post)
+    post.title = "renamed episode"
+    assert downloader.download_episode(post) == first
+    other = SimpleNamespace(
+        feed_id=post.feed_id + 1,
+        guid=post.guid,
+        title=post.title,
+        download_url="https://example.invalid/second.mp3",
+    )
+    second = downloader.download_episode(cast(Any, other))
+    assert first is not None and second is not None and first != second
+    assert Path(first).read_bytes() == b"first"
+    assert Path(second).read_bytes() == b"second"
+    assert paths_from_unprocessed_path(
+        first, "Same feed title"
+    ) != paths_from_unprocessed_path(second, "Same feed title")
+    assert request.call_count == 2
+    assert legacy.read_bytes() == b"unowned old bytes"
+
+
+def test_http_recovery_preserves_individual_and_bulk_whitelist_policy(
+    runtime: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app_module, post, _, _ = runtime
+    monkeypatch.setitem(sys.modules, "bleach", SimpleNamespace(clean=MagicMock()))
+    from app import routes
+
+    output = Path("completed.mp3")
+    output.write_bytes(b"completed audio")
+    post.processed_audio_path = str(output)
+    post.whitelisted = False
+    app_module.db.session.commit()
+    download = MagicMock(side_effect=AssertionError("unexpected download"))
+    monkeypatch.setattr(routes, "download_episode", download)
+    # pylint: disable=protected-access
+    app = cast(Any, current_app)._get_current_object()
+    assert routes.download_and_process(post, app)["status"] == "error"
+    assert (
+        routes.download_and_process(post, app, require_whitelisted=False)["status"]
+        == "success"
+    )
+    assert post.whitelisted is False
+    post.whitelisted = True
+    app_module.db.session.commit()
+    assert routes.download_and_process(post, app)["status"] == "success"
+    assert post.whitelisted is True
+    download.assert_not_called()

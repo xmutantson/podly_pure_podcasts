@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 import os
 import re
@@ -17,7 +19,7 @@ DOWNLOAD_DIR = "in"
 
 
 def download_episode(post: Post) -> Optional[str]:
-    download_path = str(get_and_make_download_path(post.title))
+    download_path = str(get_and_make_download_path(post))
     if not download_path:
         logger.error(f"Invalid download path for post {post.id}")
         return None
@@ -53,20 +55,17 @@ def download_episode(post: Post) -> Optional[str]:
     return download_path
 
 
-def get_and_make_download_path(post_title: str) -> Path:
-    # sanitized_title = re.sub(r"[^a-zA-Z0-9\s]", "", post_title)
-    sanitized_title = sanitize_title(
-        post_title
-    )  # need logic in multiple places, needs to be consistent
-
-    post_directory = sanitized_title
-    post_filename = sanitized_title + ".mp3"
-
-    post_directory_path = Path(DOWNLOAD_DIR) / post_directory
-
-    post_directory_path.mkdir(parents=True, exist_ok=True)
-
-    return post_directory_path / post_filename
+def get_and_make_download_path(post: Post) -> Path:
+    """Use stable database/feed identity, never an ambiguous display title."""
+    identity = [
+        getattr(post, "feed_id", None),
+        getattr(post, "guid", None) or getattr(post, "id", None) or post.download_url,
+    ]
+    digest = hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
+    basename = f"episode-{digest}"
+    directory = Path(DOWNLOAD_DIR) / basename
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / f"{basename}.mp3"
 
 
 def sanitize_title(title: str) -> str:

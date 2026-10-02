@@ -13,6 +13,7 @@ from app import config, db, logger, scheduler
 from app.feeds import add_or_refresh_feed, generate_feed_xml, refresh_feed
 from app.jobs import run_refresh_feed
 from app.models import Feed, Post
+from app.posts import download_and_process_post
 from podcast_processor.podcast_processor import PodcastProcessor
 from shared.podcast_downloader import download_episode
 
@@ -85,7 +86,9 @@ def set_whitelist(p_guid: str, val: str) -> flask.Response:
 processor = PodcastProcessor(config)  # pre-initialize here rather than each post
 
 
-def download_and_process(post: Post, app: Flask) -> Dict[str, Any]:
+def download_and_process(
+    post: Post, app: Flask, require_whitelisted: bool = True
+) -> Dict[str, Any]:
     """
     Downloads and processes a single podcast episode.
 
@@ -98,22 +101,13 @@ def download_and_process(post: Post, app: Flask) -> Dict[str, Any]:
     """
     try:
         with app.app_context():  # Push application context
-            # Download the episode
-            download_path = download_episode(post)
-            if download_path is None:
-                logger.error(f"Failed to download post: {post.title} (ID: {post.id})")
-                return {
-                    "post_id": post.id,
-                    "title": post.title,
-                    "status": "failed",
-                    "message": "Download failed.",
-                }
-
-            post.unprocessed_audio_path = download_path
-            db.session.commit()
-
-            # Process the episode
-            output_path = processor.process(post, blocking=True)
+            output_path = download_and_process_post(
+                post.guid,
+                blocking=True,
+                processor=processor,
+                downloader=download_episode,
+                require_whitelisted=require_whitelisted,
+            )
             if output_path is None:
                 logger.error(f"Failed to process post: {post.title} (ID: {post.id})")
                 return {
@@ -122,9 +116,6 @@ def download_and_process(post: Post, app: Flask) -> Dict[str, Any]:
                     "status": "failed",
                     "message": "Processing failed.",
                 }
-
-            post.processed_audio_path = output_path
-            db.session.commit()
 
             logger.info(
                 f"Successfully downloaded and processed post: {post.title} (ID: {post.id})"
@@ -194,7 +185,9 @@ def download_all_posts() -> flask.Response:
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all download tasks to the executor, passing both post and app
         future_to_post = {
-            executor.submit(download_and_process, post, app): post for post in posts
+            # Explicit bulk downloads retain their existing policy without changing flags.
+            executor.submit(download_and_process, post, app, False): post
+            for post in posts
         }
 
         for future in as_completed(future_to_post):

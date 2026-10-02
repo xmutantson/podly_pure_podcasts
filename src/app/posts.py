@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Optional, cast
+from typing import Callable, Optional, cast
 
 from app import config, db, logger
 from app.models import Post
@@ -8,10 +8,7 @@ from podcast_processor.podcast_processor import (
     get_post_processed_audio_path,
 )
 from shared.files import has_audio_file
-from shared.podcast_downloader import (
-    download_episode,
-    get_and_make_download_path,
-)
+from shared.podcast_downloader import download_episode
 
 
 def remove_associated_files(post: Post) -> None:
@@ -21,9 +18,7 @@ def remove_associated_files(post: Post) -> None:
     """
     try:
         # Determine unprocessed and processed paths
-        unprocessed_path = (
-            get_and_make_download_path(post.title) if post.title else None
-        )
+        unprocessed_path = post.unprocessed_audio_path
         processing_paths = get_post_processed_audio_path(post)
 
         # Define absolute paths
@@ -73,13 +68,20 @@ def remove_associated_files(post: Post) -> None:
         )
 
 
-def download_and_process_post(p_guid: str, blocking: bool = True) -> Optional[str]:
+def download_and_process_post(
+    p_guid: str,
+    blocking: bool = True,
+    *,
+    processor: Optional[PodcastProcessor] = None,
+    downloader: Optional[Callable[[Post], Optional[str]]] = None,
+    require_whitelisted: bool = True,
+) -> Optional[str]:
     post = Post.query.filter_by(guid=p_guid).first()
     if post is None:
         logger.warning(f"Post with GUID: {p_guid} not found")
         raise PostException(f"Post with GUID: {p_guid} not found")
 
-    if not post.whitelisted:
+    if require_whitelisted and not post.whitelisted:
         logger.warning(f"Post: {post.title} is not whitelisted")
         raise PostException(f"Post with GUID: {p_guid} not whitelisted")
 
@@ -94,7 +96,7 @@ def download_and_process_post(p_guid: str, blocking: bool = True) -> Optional[st
 
     if not has_audio_file(post.unprocessed_audio_path):
         post.unprocessed_audio_path = None
-        download_path = download_episode(post)
+        download_path = (downloader or download_episode)(post)
         if download_path is None:
             db.session.commit()
             raise PostException("Download failed")
@@ -103,7 +105,7 @@ def download_and_process_post(p_guid: str, blocking: bool = True) -> Optional[st
 
     # Use the processor's canonical paths and lock for both cache recovery and
     # processing. Duplicating the path logic here previously omitted '.mp3'.
-    processor = PodcastProcessor(config)
+    processor = processor or PodcastProcessor(config)
     return processor.process(post, blocking)
 
 

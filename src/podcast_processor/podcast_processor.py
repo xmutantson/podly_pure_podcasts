@@ -15,6 +15,15 @@ from app import db, logger
 from app.models import Post, Transcript
 from podcast_processor.audio import clip_segments_with_fade, get_audio_duration_ms
 from podcast_processor.model_output import clean_and_parse_model_output
+from shared.classification_cache import (
+    ClassificationChunk,
+    fingerprint,
+    read_classification,
+    read_manifest,
+    transcript_fingerprint,
+    write_classification,
+    write_manifest,
+)
 from shared.config import (
     Config,
     LocalWhisperConfig,
@@ -212,31 +221,12 @@ class PodcastProcessor:
         self.logger.info(f"Identifying ad segments for {post.unprocessed_audio_path}")
         self.logger.info(f"Processing {len(transcript_segments)} transcript segments")
 
-        for i in range(0, len(transcript_segments), num_segments_per_prompt):
-            start = i
-            end = min(i + num_segments_per_prompt, len(transcript_segments))
-            target_dir = (
-                classification_path
-                / f"{transcript_segments[start].start}_{transcript_segments[end-1].end}"
-            )
-            identification_path = target_dir / "identification.txt"
-            prompt_path = target_dir / "prompt.txt"
-            target_dir.mkdir(exist_ok=True)
-
-            # Check if we already have a valid identification
-            if identification_path.exists():
-                try:
-                    clean_and_parse_model_output(identification_path.read_text())
-                except (ValueError, AssertionError):
-                    self.logger.warning(
-                        f"Retrying invalid classification: {identification_path}"
-                    )
-                else:
-                    self.logger.info(
-                        f"Responses for segments {start} to {end} already received"
-                    )
-                    continue
-
+        if num_segments_per_prompt <= 0:
+            raise ProcessorException("Classification chunk size must be positive")
+        planned = []
+        transcript_digest = transcript_fingerprint(transcript_segments)
+        for start in range(0, len(transcript_segments), num_segments_per_prompt):
+            end = min(start + num_segments_per_prompt, len(transcript_segments))
             excerpts = [
                 f"[{segment.start}] {segment.text}"
                 for segment in transcript_segments[start:end]
@@ -246,13 +236,56 @@ class PodcastProcessor:
             elif end == len(transcript_segments):
                 excerpts.append("[TRANSCRIPT END]")
 
-            self.logger.info(f"Calling {model}")
             user_prompt = user_prompt_template.render(
                 podcast_title=post.title,
                 podcast_topic=post.description,
                 transcript="\n".join(excerpts),
             )
 
+            chunk = ClassificationChunk(
+                directory=f"{transcript_segments[start].start}_{transcript_segments[end-1].end}",
+                start=start,
+                end=end,
+                fingerprint=fingerprint(
+                    {
+                        "version": 1,
+                        "transcript": transcript_digest,
+                        "chunk_size": num_segments_per_prompt,
+                        "start": start,
+                        "end": end,
+                        "model": model,
+                        "system_prompt": system_prompt,
+                        "user_prompt": user_prompt,
+                        "max_tokens": self.config.openai_max_tokens,
+                        "api_base": self.config.openai_base_url,
+                        "test_mode": isinstance(self.config.whisper, TestWhisperConfig),
+                        "episode": post.guid,
+                        "feed": post.feed_id,
+                    }
+                ),
+            )
+            planned.append((chunk, user_prompt))
+
+        # Publish the current plan before any requests, including on partial retries.
+        # Obsolete directories have no authority over this run.
+        write_manifest(
+            classification_path, transcript_segments, [c for c, _ in planned]
+        )
+        for chunk, user_prompt in planned:
+            start, end = chunk.start, chunk.end
+            target_dir = classification_path / chunk.directory
+            target_dir.mkdir(exist_ok=True)
+            try:
+                cached = read_classification(target_dir, chunk.fingerprint)
+                clean_and_parse_model_output(cached)
+            except (OSError, ValueError, AssertionError, KeyError, TypeError):
+                pass
+            else:
+                self.logger.info(
+                    f"Responses for segments {start} to {end} already received"
+                )
+                continue
+            self.logger.info(f"Calling {model}")
             try:
                 # Indicate that processing is in progress.
                 with open(target_dir / ".in_progress", "w") as f:
@@ -269,9 +302,8 @@ class PodcastProcessor:
                     )
                 # Invalid/partial responses must never become successful cache hits.
                 clean_and_parse_model_output(identification)
-                prompt_path.write_text(user_prompt)
-                with atomic_output(identification_path) as temporary:
-                    temporary.write_text(identification)
+                (target_dir / "prompt.txt").write_text(user_prompt, encoding="utf-8")
+                write_classification(target_dir, chunk.fingerprint, identification)
             finally:
                 if (target_dir / ".in_progress").exists():
                     os.remove(target_dir / ".in_progress")
@@ -326,54 +358,28 @@ class PodcastProcessor:
     def get_ad_segments(
         self, segments: List[Segment], classification_path_path: Path
     ) -> List[Tuple[float, float]]:
-        classification_path = str(classification_path_path)
-        segments_by_start = {segment.start: segment for segment in segments}
-        ad_segments = []
-        for classification_dir in sorted(
-            os.listdir(classification_path),
-            key=lambda filename: (len(filename), filename),
-        ):
-            try:
-                with open(
-                    f"{classification_path}/{classification_dir}/identification.txt",
-                    "r",
-                ) as id_file:
-                    prompt_start_timestamp = float(classification_dir.split("_")[0])
-                    prompt_end_timestamp = float(classification_dir.split("_")[1])
-                    identification = id_file.read()
-
-                    try:
-                        prediction = clean_and_parse_model_output(identification)
-                    except Exception as e:  # pylint: disable=broad-exception-caught
-                        self.logger.error(
-                            f"Error parsing ad segment: {e} for {identification}"
-                        )
-                        raise ProcessorException(
-                            f"Invalid classification in {classification_dir}"
-                        ) from e
-
-                    if prediction.confidence < self.config.output.min_confidence:
-                        continue
-
-                    ad_segment_starts = prediction.ad_segments
-                    ad_segment_starts = [
-                        start
-                        for start in ad_segment_starts
-                        if (
-                            prompt_start_timestamp <= start <= prompt_end_timestamp
-                            and start in segments_by_start
-                        )
-                    ]
-
-                    for ad_segment_start in ad_segment_starts:
-                        ad_segment_end = segments_by_start[ad_segment_start].end
-                        ad_segments.append((ad_segment_start, ad_segment_end))
-            except FileNotFoundError as e:
-                raise ProcessorException(
-                    f"Identification file not found for {classification_dir}"
-                ) from e
-
-        return ad_segments
+        try:
+            chunks = read_manifest(classification_path_path, segments)
+            ad_segments = []
+            for chunk in chunks:
+                identification = read_classification(
+                    classification_path_path / chunk.directory, chunk.fingerprint
+                )
+                prediction = clean_and_parse_model_output(identification)
+                if prediction.confidence < self.config.output.min_confidence:
+                    continue
+                segments_by_start = {
+                    segment.start: segment
+                    for segment in segments[chunk.start : chunk.end]
+                }
+                for start in prediction.ad_segments:
+                    if start in segments_by_start:
+                        ad_segments.append((start, segments_by_start[start].end))
+            return ad_segments
+        except (OSError, ValueError, AssertionError, KeyError, TypeError) as error:
+            raise ProcessorException(
+                "Missing, invalid, or stale current classification"
+            ) from error
 
     def remove_audio_files_and_reset_db(self, post_id: Optional[int]) -> None:
         """

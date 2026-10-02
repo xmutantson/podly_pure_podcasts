@@ -74,8 +74,9 @@ Local/model processing can still block indefinitely: a real hard deadline needs
 an isolated, cancellable process with a defined database/file handoff. Existing
 nonempty files and old syntactically valid fallback classifications cannot be
 distinguished from good results automatically; no historical data was purged.
-Title-derived filenames and process-local locks remain inherited limitations,
-especially for duplicate episode titles or multiple server processes.
+The independent-review follow-up replaces title-derived download names and
+unscoped classification reuse; see `review-repair-20261002.md`. Process-local
+locks remain a limitation for multiple server processes.
 
 Any later upstream migration should use disposable copies of the deployment's
 database and media, disabled network/provider calls, and explicit checks for
