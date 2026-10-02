@@ -56,7 +56,7 @@ class Config(BaseModel):
     server: Optional[str] = None
     server_port: int = 5001
     background_update_interval_minute: Optional[int] = None
-    job_timeout: int = 10800  # Default to 3 hours if not set
+    job_timeout: int = 10800  # Soft processing budget; never abandons a running worker.
     threads: int = 1
     whisper: Optional[LocalWhisperConfig | RemoteWhisperConfig | TestWhisperConfig] = (
         Field(

@@ -7,10 +7,10 @@ from podcast_processor.podcast_processor import (
     PodcastProcessor,
     get_post_processed_audio_path,
 )
+from shared.files import has_audio_file
 from shared.podcast_downloader import (
     download_episode,
     get_and_make_download_path,
-    sanitize_title,
 )
 
 
@@ -87,70 +87,24 @@ def download_and_process_post(p_guid: str, blocking: bool = True) -> Optional[st
         f"Checking database for both unprocessed & processed files for post '{post.title}'"
     )
 
-    # 1) IF unprocessed_audio_path is missing, try to fix from disk or else download
-    if post.unprocessed_audio_path is None:
-        logger.debug(
-            "unprocessed_audio_path is None. Checking for existing file on disk."
-        )
+    # A completed result remains usable even if the source download was removed.
+    if has_audio_file(post.processed_audio_path):
+        return cast(str, post.processed_audio_path)
+    post.processed_audio_path = None
 
-        safe_post_title = sanitize_title(post.title)
-        post_subdir = safe_post_title.replace(".mp3", "")
-        expected_unprocessed_path = Path("in") / post_subdir / safe_post_title
-
-        if (
-            expected_unprocessed_path.exists()
-            and expected_unprocessed_path.stat().st_size > 0
-        ):
-            # Found a local unprocessed file
-            post.unprocessed_audio_path = str(expected_unprocessed_path.resolve())
-            logger.info(
-                f"Found existing unprocessed audio for post '{post.title}' at '{post.unprocessed_audio_path}'. "  # pylint: disable=line-too-long
-                "Updated the database path."
-            )
+    if not has_audio_file(post.unprocessed_audio_path):
+        post.unprocessed_audio_path = None
+        download_path = download_episode(post)
+        if download_path is None:
             db.session.commit()
-        else:
-            logger.info(f"Downloading post: {post.title}")
-            download_path = download_episode(post)
-            if download_path is None:
-                raise PostException("Download failed")
-            post.unprocessed_audio_path = download_path
-            db.session.commit()
+            raise PostException("Download failed")
+        post.unprocessed_audio_path = download_path
+        db.session.commit()
 
-    # 2) IF processed_audio_path is missing, try to fix from disk or else run processor
-    if post.processed_audio_path is None:
-        logger.debug(
-            "processed_audio_path is None. Checking for existing file on disk."
-        )
-
-        safe_feed_title = sanitize_title(post.feed.title)
-        safe_post_title = sanitize_title(post.title)
-        expected_processed_path = (
-            Path("srv") / safe_feed_title / f"{safe_post_title}.mp3"
-        )
-
-        if (
-            expected_processed_path.exists()
-            and expected_processed_path.stat().st_size > 0
-        ):
-            # Found a local processed file
-            post.processed_audio_path = str(expected_processed_path.resolve())
-            logger.info(
-                f"Found existing processed audio for post '{post.title}' at '{post.processed_audio_path}'. "  # pylint: disable=line-too-long
-                "Updated the database path."
-            )
-            db.session.commit()
-        else:
-            logger.info(f"Processing post: {post.title}")
-            # Assume 'config' is imported from your configuration module.
-            processor = PodcastProcessor(config)
-            output_path = processor.process(post, blocking)
-            if output_path is None:
-                raise PostException("Processing failed")
-            post.processed_audio_path = output_path
-            db.session.commit()
-
-    logger.info("Post already downloaded and validated")
-    return cast(Optional[str], post.processed_audio_path)
+    # Use the processor's canonical paths and lock for both cache recovery and
+    # processing. Duplicating the path logic here previously omitted '.mp3'.
+    processor = PodcastProcessor(config)
+    return processor.process(post, blocking)
 
 
 class PostException(Exception):

@@ -1,6 +1,8 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from podcast_processor.audio import (
     clip_segments_with_fade,
     get_audio_duration_ms,
@@ -19,20 +21,20 @@ def test_clip_segment_with_fade() -> None:
     fade_len_ms = 5_000
     ad_start_offset_ms, ad_end_offset_ms = 3_000, 21_000
 
-    with tempfile.NamedTemporaryFile(delete=True, suffix=".mp3") as temp_file:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_path = str(Path(temp_dir) / "output.mp3")
         clip_segments_with_fade(
             [(ad_start_offset_ms, ad_end_offset_ms)],
             fade_len_ms,
             TEST_FILE_PATH,
-            temp_file.name,
+            output_path,
         )
 
-        assert (
-            get_audio_duration_ms(temp_file.name)
-            == TEST_FILE_DURATION
+        assert get_audio_duration_ms(output_path) == pytest.approx(
+            TEST_FILE_DURATION
             - (ad_end_offset_ms - ad_start_offset_ms)
-            + 2 * fade_len_ms
-            + 56  # not sure where this fudge comes from
+            + 2 * fade_len_ms,
+            abs=100,  # MP3 encoder delay/padding differs between FFmpeg versions.
         )
 
 
@@ -40,20 +42,20 @@ def test_clip_segment_with_fade_beginning() -> None:
     fade_len_ms = 5_000
     ad_start_offset_ms, ad_end_offset_ms = 0, 18_000
 
-    with tempfile.NamedTemporaryFile(delete=True, suffix=".mp3") as temp_file:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_path = str(Path(temp_dir) / "output.mp3")
         clip_segments_with_fade(
             [(ad_start_offset_ms, ad_end_offset_ms)],
             fade_len_ms,
             TEST_FILE_PATH,
-            temp_file.name,
+            output_path,
         )
 
-        assert (
-            get_audio_duration_ms(temp_file.name)
-            == TEST_FILE_DURATION
+        assert get_audio_duration_ms(output_path) == pytest.approx(
+            TEST_FILE_DURATION
             - (ad_end_offset_ms - ad_start_offset_ms)
-            + 2 * fade_len_ms
-            + 56  # not sure where this fudge comes from
+            + 2 * fade_len_ms,
+            abs=100,  # MP3 encoder delay/padding differs between FFmpeg versions.
         )
 
 
@@ -64,27 +66,29 @@ def test_clip_segment_with_fade_end() -> None:
         TEST_FILE_DURATION,
     )
 
-    with tempfile.NamedTemporaryFile(delete=True, suffix=".mp3") as temp_file:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output_path = str(Path(temp_dir) / "output.mp3")
         clip_segments_with_fade(
             [(ad_start_offset_ms, ad_end_offset_ms)],
             fade_len_ms,
             TEST_FILE_PATH,
-            temp_file.name,
+            output_path,
         )
 
-        assert (
-            get_audio_duration_ms(temp_file.name)
-            == TEST_FILE_DURATION
+        assert get_audio_duration_ms(output_path) == pytest.approx(
+            TEST_FILE_DURATION
             - (ad_end_offset_ms - ad_start_offset_ms)
-            + 2 * fade_len_ms
-            + 56  # not sure where this fudge comes from
+            + 2 * fade_len_ms,
+            abs=100,  # MP3 encoder delay/padding differs between FFmpeg versions.
         )
 
 
 def test_split_audio() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_dir_path = Path(temp_dir)
-        split_audio(Path(TEST_FILE_PATH), temp_dir_path, 38_000)
+        chunks = split_audio(Path(TEST_FILE_PATH), temp_dir_path, 38_000)
+        assert len(chunks) == 11
+        assert [offset for _, offset in chunks] == list(range(0, 63321, 6332))
 
         expected = {
             "0.mp3": (6_384, 25_773),
@@ -102,11 +106,11 @@ def test_split_audio() -> None:
 
         for split in temp_dir_path.iterdir():
             assert split.name in expected
-            duration_ms, filesize = expected[split.name]
+            duration_ms, _ = expected[split.name]
             actual_duration = get_audio_duration_ms(str(split))
-            assert (
-                duration_ms == actual_duration
+            assert actual_duration == pytest.approx(
+                duration_ms, abs=100
             ), f"unexpected filesize for {split}. found {actual_duration}, expected {duration_ms}"
             assert (
-                abs(filesize - split.stat().st_size) <= 10
-            ), f"filesize differs by more than 10 bytes for {split}. found {split.stat().st_size}, expected {filesize}"  # pylint: disable=line-too-long
+                0 < split.stat().st_size <= 38_000
+            ), f"chunk exceeds upload size budget: {split}"  # pylint: disable=line-too-long

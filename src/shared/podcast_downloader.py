@@ -9,6 +9,7 @@ import validators
 from flask import abort
 
 from app.models import Post
+from shared.files import atomic_output
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +39,11 @@ def download_episode(post: Post) -> Optional[str]:
         abort(404)
 
     logger.info(f"Downloading {audio_link} into {download_path}...")
-    response = requests.get(audio_link)  # pylint: disable=missing-timeout
+    response = requests.get(audio_link, timeout=(10, 60))
     if response.status_code == 200:
-        with open(download_path, "wb") as file:
-            file.write(response.content)
-            logger.info("Download complete.")
+        with atomic_output(Path(download_path)) as temporary:
+            temporary.write_bytes(response.content)
+        logger.info("Download complete.")
     else:
         logger.info(
             f"Failed to download the podcast episode, response: {response.status_code}"

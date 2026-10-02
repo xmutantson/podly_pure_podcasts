@@ -21,6 +21,7 @@ from shared.config import (
     RemoteWhisperConfig,
     TestWhisperConfig,
 )
+from shared.files import atomic_output, has_audio_file
 from shared.processing_paths import ProcessingPaths, paths_from_unprocessed_path
 
 from .transcribe import (
@@ -106,8 +107,10 @@ class PodcastProcessor:
             raise ProcessorException("Processing job in progress")
 
         try:
-            if os.path.exists(processed_audio_path):
+            if has_audio_file(processed_audio_path):
                 self.logger.info(f"Audio already processed: {post}")
+                post.processed_audio_path = processed_audio_path
+                db.session.commit()
                 return processed_audio_path
             self.make_dirs(working_paths)
             transcript_segments = self.transcribe(post)
@@ -143,12 +146,13 @@ class PodcastProcessor:
                     self.config.output.min_ad_segement_separation_seconds
                 ),  # pylint: disable=line-too-long
             )
-            clip_segments_with_fade(
-                in_path=post.unprocessed_audio_path,
-                ad_segments_ms=merged_ad_segments,
-                fade_ms=self.config.output.fade_ms,
-                out_path=processed_audio_path,
-            )
+            with atomic_output(Path(processed_audio_path)) as temporary:
+                clip_segments_with_fade(
+                    in_path=post.unprocessed_audio_path,
+                    ad_segments_ms=merged_ad_segments,
+                    fade_ms=self.config.output.fade_ms,
+                    out_path=str(temporary),
+                )
             self.logger.info(f"Processing podcast: {post} complete")
             post.processed_audio_path = processed_audio_path
             db.session.commit()
@@ -221,10 +225,17 @@ class PodcastProcessor:
 
             # Check if we already have a valid identification
             if identification_path.exists():
-                self.logger.info(
-                    f"Responses for segments {start} to {end} already received"
-                )
-                continue
+                try:
+                    clean_and_parse_model_output(identification_path.read_text())
+                except (ValueError, AssertionError):
+                    self.logger.warning(
+                        f"Retrying invalid classification: {identification_path}"
+                    )
+                else:
+                    self.logger.info(
+                        f"Responses for segments {start} to {end} already received"
+                    )
+                    continue
 
             excerpts = [
                 f"[{segment.start}] {segment.text}"
@@ -248,21 +259,19 @@ class PodcastProcessor:
                     f.write("Processing")
 
                 identification = (
-                    None
+                    '{"ad_segments": [], "confidence": 0.0}'
                     if isinstance(self.config.whisper, TestWhisperConfig)
                     else self.call_model(model, system_prompt, user_prompt)
                 )
-                if identification:
-                    with open(identification_path, "w") as f:
-                        f.write(identification)
-                    with open(prompt_path, "w") as f:
-                        f.write(user_prompt)
-                else:
-                    self.logger.error(
-                        f"Failed to get identification for segments {start} to {end}"
+                if not identification:
+                    raise ProcessorException(
+                        f"No classification returned for segments {start} to {end}"
                     )
-                    with open(identification_path, "w") as f:
-                        f.write('{"ad_segments": [], "confidence": 0.0}')
+                # Invalid/partial responses must never become successful cache hits.
+                clean_and_parse_model_output(identification)
+                prompt_path.write_text(user_prompt)
+                with atomic_output(identification_path) as temporary:
+                    temporary.write_text(identification)
             finally:
                 if (target_dir / ".in_progress").exists():
                     os.remove(target_dir / ".in_progress")
@@ -339,8 +348,9 @@ class PodcastProcessor:
                         self.logger.error(
                             f"Error parsing ad segment: {e} for {identification}"
                         )
-                        # can this skip result in hung processing?
-                        continue
+                        raise ProcessorException(
+                            f"Invalid classification in {classification_dir}"
+                        ) from e
 
                     if prediction.confidence < self.config.output.min_confidence:
                         continue
@@ -358,10 +368,10 @@ class PodcastProcessor:
                     for ad_segment_start in ad_segment_starts:
                         ad_segment_end = segments_by_start[ad_segment_start].end
                         ad_segments.append((ad_segment_start, ad_segment_end))
-            except FileNotFoundError:
-                self.logger.error(
+            except FileNotFoundError as e:
+                raise ProcessorException(
                     f"Identification file not found for {classification_dir}"
-                )
+                ) from e
 
         return ad_segments
 
@@ -412,7 +422,7 @@ class PodcastProcessor:
         min_ad_segment_separation_seconds: float,
         ad_segments: List[Tuple[float, float]],
     ) -> List[Tuple[int, int]]:
-        audio_duration_seconds = 1000 * duration_ms
+        audio_duration_seconds = duration_ms / 1000
 
         self.logger.info(
             f"Creating new audio with ads segments removed between: {ad_segments}"
@@ -425,7 +435,10 @@ class PodcastProcessor:
                 ad_segments[i][1] + min_ad_segment_separation_seconds
                 >= ad_segments[i + 1][0]
             ):
-                ad_segments[i] = (ad_segments[i][0], ad_segments[i + 1][1])
+                ad_segments[i] = (
+                    ad_segments[i][0],
+                    max(ad_segments[i][1], ad_segments[i + 1][1]),
+                )
                 ad_segments.pop(i + 1)
             else:
                 i += 1
