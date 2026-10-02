@@ -52,6 +52,22 @@ delete, or adopt old title-only/numeric-ID files. An orphaned legacy file never
 becomes a new download merely because a computed name matches. Historical wrong
 bytes already associated with a database row still require manual inspection.
 Cleanup uses the persisted source path rather than guessing from a title.
+Migration restart behavior is protected by a real SQLAlchemy savepoint around
+schema changes, namespace backfill, and constraint/table reconstruction. This
+covers SQLite's deferred outer transaction, which previously let `ADD COLUMN`
+survive a backfill failure. An interrupted attempt rolls these changes back.
+For partial states left by the previous implementation, the migration checks
+whether the column and constraints already exist and fills only NULL namespaces.
+It retains every already-assigned namespace and all existing Feed/Post/Transcript
+data. It can also finish a retry after the schema succeeded but Alembic's revision
+update failed. No global database transaction settings were changed.
+
+Regressions inject failures at the first/second backfill writes, table copy,
+table rename, and revision update against actual on-disk SQLite/Alembic, then
+perform a clean startup retry. Separate tests seed committed partial backfill,
+completed backfill, and completed schema with the old revision to verify stable
+namespace reuse. These are synthetic transient failures, not power-loss testing.
+
 Downgrading removes the namespace column but retains media and Post paths;
 re-upgrading assigns new namespaces and does not adopt orphaned version 2 files.
 
